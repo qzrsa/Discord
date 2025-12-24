@@ -8,7 +8,7 @@
 module.exports = class Discord自动翻译 {
     constructor() {
         this.settings = { 
-            provider: "siliconflow", // 默认供应商
+            provider: "siliconflow", 
             apiKey: "", 
             model: "deepseek-ai/DeepSeek-V3",
             autoTranslate: true 
@@ -74,7 +74,6 @@ module.exports = class Discord自动翻译 {
         translationEl.innerText = "...";
         container.appendChild(translationEl);
 
-        // 根据供应商决定 API 地址
         const apiUrl = this.settings.provider === "volcengine" 
             ? "https://ark.cn-beijing.volces.com/api/v3/chat/completions"
             : "https://api.siliconflow.cn/v1/chat/completions";
@@ -103,7 +102,6 @@ module.exports = class Discord自动翻译 {
             }
         } catch (e) {
             translationEl.innerHTML = `<span style="color: #f04747; opacity: 0.7;">翻译出错: ${e.message}</span>`;
-            // 如果报错是 404，可能是因为火山方舟的模型 ID 填错了
             if(e.message.includes("404")) translationEl.innerText = "错误: 请检查 Endpoint ID 是否正确";
         }
     }
@@ -144,10 +142,6 @@ module.exports = class Discord自动翻译 {
 
         panel.querySelector("#sf-provider").onchange = (e) => {
             this.settings.provider = e.target.value;
-            // 切换平台时，如果是切换到火山，顺便改一下默认模型提示
-            if(e.target.value === "volcengine" && !this.settings.model.startsWith("ep-")) {
-                BdApi.UI.showToast("使用火山方舟请务必修改 Endpoint ID", {type: "warn"});
-            }
             this.save();
         };
         
@@ -166,6 +160,6 @@ module.exports = class Discord自动翻译 {
 
     save() {
         BdApi.Data.save("Discord自动翻译", "settings", this.settings);
-        this.observedMessages.clear(); // 更改设置后清空缓存，尝试重新翻译
+        this.observedMessages.clear();
     }
 };
