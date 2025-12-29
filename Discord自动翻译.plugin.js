@@ -1,8 +1,8 @@
 /**
  * @name Discord自动翻译
  * @author 丶曲終人散ゞ
- * @version 1.5.1
- * @description 支持硅基流动(DeepSeek)和火山方舟(豆包)双接口，实时监测并自动翻译消息；支持手动点击翻译。
+ * @version 1.5.2
+ * @description 支持硅基流动(DeepSeek)和火山方舟(豆包)双接口，实时监测并自动翻译消息，支持手动点击翻译。
  */
 
 module.exports = class Discord自动翻译 {
@@ -77,10 +77,12 @@ module.exports = class Discord自动翻译 {
         const btn = document.createElement("span");
         btn.className = "ai-translate-btn";
         btn.innerText = "翻译";
-        btn.style.cssText = "display:inline-block;margin-left:8px;cursor:pointer;font-size:12px;opacity:.75;user-select:none;";
+        btn.style.cssText = "display:inline-flex;align-items:center;justify-content:center;margin-left:8px;padding:2px 8px;border-radius:6px;background:rgba(88,101,242,.18);border:1px solid rgba(88,101,242,.45);color:#5865f2;font-weight:700;font-size:12px;line-height:18px;cursor:pointer;user-select:none;";
 
-        btn.onmouseenter = () => btn.style.opacity = "1";
-        btn.onmouseleave = () => btn.style.opacity = ".75";
+        btn.onmouseenter = () => btn.style.background = "rgba(88,101,242,.28)";
+        btn.onmouseleave = () => btn.style.background = "rgba(88,101,242,.18)";
+        btn.onmousedown = () => btn.style.transform = "scale(0.98)";
+        btn.onmouseup = () => btn.style.transform = "scale(1)";
 
         btn.onclick = async (e) => {
             e.stopPropagation();
