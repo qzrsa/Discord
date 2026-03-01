@@ -1,8 +1,8 @@
 /**
  * @name Discord自动翻译
  * @author 丶曲終人散ゞ
- * @version 1.5.2
- * @description 支持硅基流动(DeepSeek)和火山方舟(豆包)双接口，实时监测并自动翻译消息，支持手动点击翻译。
+ * @version 1.6.0
+ * @description  支持硅基流动和火山方舟，实时监测并自动翻译消息，支持手动点击翻译。
  */
 
 module.exports = class Discord自动翻译 {
@@ -10,35 +10,56 @@ module.exports = class Discord自动翻译 {
         this.settings = {
             provider: "siliconflow",
             apiKey: "",
-            model: "deepseek-ai/DeepSeek-V3",
+            model: "deepseek-ai/DeepSeek-V3.2",
             autoTranslate: true,
             manualTranslate: true
         };
-        this.observedMessages = new Set();
+        
+        this.translateQueue = [];
+        this.activeRequests = 0;
+        this.maxConcurrent = 5; 
+        this.translationCache = new Map(); 
     }
 
     start() {
         this.loadSettings();
+        this.smartScan = this.throttle(() => this.scanForMessages(), 150);
 
         this.observer = new MutationObserver(() => {
-            this.scanForMessages();
+            this.smartScan();
         });
 
-        const chatContent = document.querySelector("nav + div") || document.body;
-        this.observer.observe(chatContent, { childList: true, subtree: true });
+        const appMount = document.getElementById("app-mount") || document.body;
+        this.observer.observe(appMount, { childList: true, subtree: true });
 
-        this.scanInterval = setInterval(() => this.scanForMessages(), 2000);
-
-        this.scanForMessages();
-        BdApi.UI.showToast("Discord自动翻译已启动", { type: "info" });
+        this.smartScan();
+        BdApi.UI.showToast("Discord自动翻译 1.6.0 已启动", { type: "info" });
     }
 
     stop() {
         if (this.observer) this.observer.disconnect();
-        if (this.scanInterval) clearInterval(this.scanInterval);
-        this.observedMessages.clear();
+        this.translateQueue = [];
+        this.activeRequests = 0;
         document.querySelectorAll(".ai-translation-inline").forEach(el => el.remove());
         document.querySelectorAll(".ai-translate-btn").forEach(el => el.remove());
+    }
+
+    throttle(func, wait) {
+        let timeout = null;
+        let lastRun = 0;
+        return (...args) => {
+            const now = Date.now();
+            if (now - lastRun >= wait) {
+                func.apply(this, args);
+                lastRun = now;
+            } else {
+                clearTimeout(timeout);
+                timeout = setTimeout(() => {
+                    func.apply(this, args);
+                    lastRun = Date.now();
+                }, wait - (now - lastRun));
+            }
+        };
     }
 
     loadSettings() {
@@ -48,26 +69,95 @@ module.exports = class Discord自动翻译 {
 
     save() {
         BdApi.Data.save("Discord自动翻译", "settings", this.settings);
-        this.observedMessages.clear();
+        document.querySelectorAll('[data-ai-scanned-text]').forEach(el => {
+            delete el.dataset.aiScannedText;
+        });
+        this.scanForMessages();
+    }
+
+    getCleanText(container) {
+        if (!container.querySelector('.ai-translate-btn') && !container.querySelector('.ai-translation-inline')) {
+            return container.textContent.trim();
+        }
+        const clone = container.cloneNode(true);
+        clone.querySelectorAll('.ai-translate-btn, .ai-translation-inline').forEach(n => n.remove());
+        return clone.textContent.trim();
+    }
+
+    insertPlaceholder(container, text) {
+        let el = container.querySelector(".ai-translation-inline");
+        if (!el) {
+            el = document.createElement("div");
+            el.className = "ai-translation-inline";
+            el.style.cssText = "color:#43b581;font-size:.85em;margin-top:4px;padding:4px 8px;background:rgba(67,181,129,.05);border-left:2px solid #43b581;border-radius:4px;";
+            container.appendChild(el);
+        }
+        el.innerHTML = text; 
+        return el;
     }
 
     scanForMessages() {
-        const messageElements = document.querySelectorAll('[id^="message-content-"]');
+        if (this.translationCache.size > 2000) {
+            const keysToDelete = Array.from(this.translationCache.keys()).slice(0, 500);
+            keysToDelete.forEach(k => this.translationCache.delete(k));
+        }
+
+        const messageElements = Array.from(document.querySelectorAll('[id^="message-content-"]')).reverse();
+        const newTasks = [];
 
         messageElements.forEach((el) => {
-            if (this.settings.manualTranslate) this.injectManualTranslateButton(el);
+            const cleanText = this.getCleanText(el);
+            if (!cleanText) return; 
 
+            if (this.settings.manualTranslate) {
+                this.injectManualTranslateButton(el);
+            }
+
+            if (el.dataset.aiScannedText === cleanText) return;
+            
             if (!this.settings.autoTranslate) return;
 
-            const messageId = el.id;
-            if (messageId && !this.observedMessages.has(messageId)) {
-                const text = el.innerText.trim();
-                if (text.length > 1 && this.isNotChinese(text)) {
-                    this.observedMessages.add(messageId);
-                    this.doTranslateInline(text, el);
+            if (cleanText.length > 1 && this.isNotChinese(cleanText)) {
+                const cacheKey = el.id + "|" + cleanText;
+                const cachedData = this.translationCache.get(cacheKey);
+
+                el.querySelectorAll('.ai-translation-inline').forEach(n => n.remove());
+                el.dataset.aiScannedText = cleanText; 
+
+                if (cachedData) {
+                    if (cachedData.status === 'done') {
+                        this.insertPlaceholder(el, cachedData.text);
+                    } else if (cachedData.status === 'translating') {
+                        this.insertPlaceholder(el, cachedData.text || "翻译中...");
+                    } else if (cachedData.status === 'error') {
+                        this.insertPlaceholder(el, cachedData.text);
+                    }
+                } else {
+                    this.translationCache.set(cacheKey, { status: 'pending', text: '' });
+                    this.insertPlaceholder(el, "排队准备翻译中...");
+                    newTasks.push({ cacheKey, messageId: el.id, originalText: cleanText });
                 }
+            } else {
+                el.dataset.aiScannedText = cleanText;
             }
         });
+
+        if (newTasks.length > 0) {
+            this.translateQueue = [...newTasks, ...this.translateQueue];
+            this.processQueue();
+        }
+    }
+
+    processQueue() {
+        while (this.translateQueue.length > 0 && this.activeRequests < this.maxConcurrent) {
+            const task = this.translateQueue.shift();
+            this.activeRequests++;
+            
+            this.doTranslateInline(task).finally(() => {
+                this.activeRequests--;
+                this.processQueue();
+            });
+        }
     }
 
     injectManualTranslateButton(container) {
@@ -84,10 +174,10 @@ module.exports = class Discord自动翻译 {
         btn.onmousedown = () => btn.style.transform = "scale(0.98)";
         btn.onmouseup = () => btn.style.transform = "scale(1)";
 
-        btn.onclick = async (e) => {
+        btn.onclick = (e) => {
             e.stopPropagation();
 
-            const text = container.innerText.trim();
+            const text = this.getCleanText(container);
             if (!text || text.length < 2) return;
 
             if (!this.settings.apiKey) {
@@ -95,27 +185,75 @@ module.exports = class Discord自动翻译 {
                 return;
             }
 
+            const cacheKey = container.id + "|" + text;
+            this.translationCache.set(cacheKey, { status: 'pending', text: '' });
+            container.dataset.aiScannedText = text;
+
             container.querySelectorAll(".ai-translation-inline").forEach(el => el.remove());
-            await this.doTranslateInline(text, container);
+            this.doTranslateInline({ cacheKey, messageId: container.id, originalText: text });
         };
 
         container.appendChild(btn);
     }
 
     isNotChinese(text) {
-        const chineseChars = text.match(/[\u4E00-\u9FA5]/g);
-        if (!chineseChars) return true;
-        return (chineseChars.length / text.length) < 0.3;
+        let cleanText = text.replace(/https?:\/\/[^\s]+/g, '').trim();
+        if (cleanText.length === 0) return false;
+
+        const chineseChars = cleanText.match(/[\u4E00-\u9FA5]/g);
+        if (!chineseChars) return true; 
+        return (chineseChars.length / cleanText.length) < 0.3;
     }
 
-    async doTranslateInline(originalText, container) {
+    getScroller(el) {
+        let current = el.parentElement;
+        while (current && current !== document.body) {
+            const style = window.getComputedStyle(current);
+            if (style.overflowY === 'auto' || style.overflowY === 'scroll' || style.overflowY === 'overlay') {
+                return current;
+            }
+            current = current.parentElement;
+        }
+        return document.querySelector('[data-list-id="chat-messages"]') || el.closest('[class*="scroller-"]');
+    }
+
+    maintainScroll(scroller, container, action) {
+        if (!scroller) {
+            action();
+            return;
+        }
+        const isAtBottom = Math.abs(scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight) < 500;
+        const oldScrollTop = scroller.scrollTop;
+        const oldScrollHeight = scroller.scrollHeight;
+
+        action();
+
+        const heightDiff = scroller.scrollHeight - oldScrollHeight;
+
+        if (isAtBottom) {
+            scroller.scrollTop = scroller.scrollHeight;
+        } else if (heightDiff > 0) {
+            const containerRect = container.getBoundingClientRect();
+            const scrollerRect = scroller.getBoundingClientRect();
+            if (containerRect.top < scrollerRect.top) {
+                scroller.scrollTop = oldScrollTop + heightDiff;
+            }
+        }
+    }
+
+    async doTranslateInline(task) {
+        const { cacheKey, messageId, originalText } = task;
         if (!this.settings.apiKey) return;
 
-        const translationEl = document.createElement("div");
-        translationEl.className = "ai-translation-inline";
-        translationEl.style.cssText = "color:#43b581;font-size:.85em;margin-top:4px;padding:4px 8px;background:rgba(67,181,129,.05);border-left:2px solid #43b581;border-radius:4px;";
-        translationEl.innerText = "...";
-        container.appendChild(translationEl);
+        const cachedData = this.translationCache.get(cacheKey);
+        if (!cachedData) return; 
+
+        cachedData.status = 'translating';
+
+        let currentContainer = document.getElementById(messageId);
+        if (currentContainer && currentContainer.dataset.aiScannedText === originalText) {
+            this.insertPlaceholder(currentContainer, "正在请求大模型...");
+        }
 
         const apiUrl = this.settings.provider === "volcengine"
             ? "https://ark.cn-beijing.volces.com/api/v3/chat/completions"
@@ -131,21 +269,71 @@ module.exports = class Discord自动翻译 {
                 body: JSON.stringify({
                     model: this.settings.model,
                     messages: [
-                        { role: "system", content: "你是一个翻译助手，只需将内容翻译成中文，直接输出结果。" },
+                        { role: "system", content: "你是一个翻译助手，只需将内容翻译成中文，直接输出结果，不要输出任何额外的解释。" },
                         { role: "user", content: originalText }
-                    ]
+                    ],
+                    stream: true
                 })
             });
 
-            const data = await response.json();
-            if (data.choices && data.choices[0]) {
-                translationEl.innerText = data.choices[0].message.content;
-            } else {
-                throw new Error(data.error?.message || "接口返回异常");
+            if (!response.ok) {
+                const errText = await response.text();
+                throw new Error(`HTTP ${response.status}: ${errText.slice(0, 50)}`);
             }
+
+            const reader = response.body.getReader();
+            const decoder = new TextDecoder("utf-8");
+            let isFirstChunk = true;
+
+            while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                
+                const chunk = decoder.decode(value, { stream: true });
+                const lines = chunk.split('\n');
+
+                for (const line of lines) {
+                    if (line.trim() === '') continue;
+                    if (line.trim() === 'data: [DONE]') continue;
+                    
+                    if (line.startsWith('data: ')) {
+                        try {
+                            const data = JSON.parse(line.slice(6));
+                            if (data.choices && data.choices[0].delta && data.choices[0].delta.content) {
+                                if (isFirstChunk) {
+                                    cachedData.text = ""; 
+                                    isFirstChunk = false;
+                                }
+                                cachedData.text += data.choices[0].delta.content;
+
+                                const activeContainer = document.getElementById(messageId);
+                                if (activeContainer && activeContainer.dataset.aiScannedText === originalText) {
+                                    const scroller = this.getScroller(activeContainer);
+                                    this.maintainScroll(scroller, activeContainer, () => {
+                                        let el = activeContainer.querySelector(".ai-translation-inline");
+                                        if (!el) el = this.insertPlaceholder(activeContainer, "");
+                                        el.innerText = cachedData.text;
+                                    });
+                                }
+                            }
+                        } catch (err) {}
+                    }
+                }
+            }
+            cachedData.status = 'done';
         } catch (e) {
-            translationEl.innerHTML = `<span style="color:#f04747;opacity:.7;">翻译出错: ${e.message}</span>`;
-            if (String(e.message).includes("404")) translationEl.innerText = "错误: 请检查 Endpoint ID 是否正确";
+            cachedData.status = 'error';
+            cachedData.text = `<span style="color:#f04747;opacity:.7;">翻译出错: ${e.message}</span>`;
+            
+            const activeContainer = document.getElementById(messageId);
+            if (activeContainer && activeContainer.dataset.aiScannedText === originalText) {
+                const scroller = this.getScroller(activeContainer);
+                this.maintainScroll(scroller, activeContainer, () => {
+                    let el = activeContainer.querySelector(".ai-translation-inline");
+                    if (!el) el = this.insertPlaceholder(activeContainer, "");
+                    el.innerHTML = cachedData.text;
+                });
+            }
         }
     }
 
