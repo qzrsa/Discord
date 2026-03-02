@@ -367,9 +367,9 @@ module.exports = class Discord自动翻译 {
             </div>
 
             <div>
-                <label style="display:block;margin-bottom:5px;">模型名称 / Endpoint ID</label>
+                <label style="display:block;margin-bottom:5px;">模型名称 / 接入点名称</label>
                 <input type="text" id="m" value="${this.settings.model}" placeholder="DeepSeek-V3 或 火山接入点ID">
-                <p style="font-size:11px;color:#666;margin-top:5px;">注：火山方舟请填写控制台的“推理接入点 ID”(ep-xxxxxx)。</p>
+                <p style="font-size:11px;color:#666;margin-top:5px;">注：火山方舟请填写控制台的“接入点 ID”(ep-xxxxxx)。</p>
             </div>
         `;
 
@@ -430,3 +430,4 @@ module.exports = class Discord自动翻译 {
         return panel;
     }
 };
+
