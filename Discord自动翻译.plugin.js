@@ -1,8 +1,8 @@
 /**
  * @name Discord自动翻译
  * @author 丶曲終人散ゞ
- * @version 1.6.1
- * @description  支持硅基流动和火山方舟，实时监测并自动翻译消息，支持手动点击翻译。
+ * @version 1.7.0
+ * @description  支持硅基流动和火山方舟，实时监测并自动翻译消息，支持手动点击翻译，失败自动退避重试。
  */
 
 module.exports = class Discord自动翻译 {
@@ -19,9 +19,14 @@ module.exports = class Discord自动翻译 {
         this.activeRequests = 0;
         this.maxConcurrent = 5; 
         this.translationCache = new Map(); 
+        this.scrollerCache = new WeakMap();
+        this.maxAttempts = 3;
+        this.retryBaseDelay = 1000;
+        this.destroyed = false;
     }
 
     start() {
+        this.destroyed = false;
         this.loadSettings();
         this.smartScan = this.throttle(() => this.scanForMessages(), 150);
 
@@ -33,13 +38,16 @@ module.exports = class Discord自动翻译 {
         this.observer.observe(appMount, { childList: true, subtree: true });
 
         this.smartScan();
-        BdApi.UI.showToast("Discord自动翻译 1.6.1 已启动", { type: "info" });
+        BdApi.UI.showToast("Discord自动翻译 1.7.0 已启动", { type: "info" });
     }
 
     stop() {
+        this.destroyed = true;
         if (this.observer) this.observer.disconnect();
         this.translateQueue = [];
         this.activeRequests = 0;
+        this.translationCache.clear();
+        this.scrollerCache = new WeakMap();
         document.querySelectorAll(".ai-translation-inline").forEach(el => el.remove());
         document.querySelectorAll(".ai-translate-btn").forEach(el => el.remove());
     }
@@ -106,7 +114,63 @@ module.exports = class Discord自动翻译 {
             el.style.borderLeftColor = isError ? "#f04747" : "#43b581";
             el.style.background = isError ? "rgba(240,71,71,.06)" : "rgba(67,181,129,.05)";
             el.textContent = text;
+
+            if (isError) {
+                // 出错条目点击即可重试，不必等消息内容变化
+                el.style.cursor = "pointer";
+                el.title = "点击重试";
+                el.onclick = (e) => {
+                    e.stopPropagation();
+                    this.startTranslate(container);
+                };
+            } else {
+                el.style.cursor = "";
+                el.title = "";
+                el.onclick = null;
+            }
         });
+    }
+
+    getThemeColors() {
+        const isDark = document.body.classList.contains("theme-dark") ||
+            !document.body.classList.contains("theme-light");
+        return isDark
+            ? {
+                panelText: "#dbdee1",
+                inputBg: "#1e1f22",
+                inputColor: "#dbdee1",
+                border: "#111214",
+                hint: "#949ba4",
+                optionBg: "#2b2d31"
+            }
+            : {
+                panelText: "#111111",
+                inputBg: "#ffffff",
+                inputColor: "#111111",
+                border: "#bbbbbb",
+                hint: "#666666",
+                optionBg: "#ffffff"
+            };
+    }
+
+    // 发起一次翻译（手动按钮与错误重试共用）
+    startTranslate(container) {
+        if (!container) return;
+        if (!this.settings.apiKey) {
+            BdApi.UI.showToast("请先在设置里填写 API Key", { type: "warning" });
+            return;
+        }
+
+        const text = this.getCleanText(container);
+        if (!text || text.length < 2) return;
+
+        const cacheKey = container.id + "|" + text;
+        this.translationCache.set(cacheKey, { status: 'pending', text: '' });
+        container.dataset.aiScannedText = text;
+
+        container.querySelectorAll(".ai-translation-inline").forEach(el => el.remove());
+        this.renderTranslation(container, "正在请求大模型...");
+        this.doTranslateInline({ cacheKey, messageId: container.id, originalText: text });
     }
 
     scanForMessages() {
@@ -189,21 +253,7 @@ module.exports = class Discord自动翻译 {
 
         btn.onclick = (e) => {
             e.stopPropagation();
-
-            const text = this.getCleanText(container);
-            if (!text || text.length < 2) return;
-
-            if (!this.settings.apiKey) {
-                BdApi.UI.showToast("请先在设置里填写 API Key", { type: "warning" });
-                return;
-            }
-
-            const cacheKey = container.id + "|" + text;
-            this.translationCache.set(cacheKey, { status: 'pending', text: '' });
-            container.dataset.aiScannedText = text;
-
-            container.querySelectorAll(".ai-translation-inline").forEach(el => el.remove());
-            this.doTranslateInline({ cacheKey, messageId: container.id, originalText: text });
+            this.startTranslate(container);
         };
 
         container.appendChild(btn);
@@ -219,15 +269,25 @@ module.exports = class Discord自动翻译 {
     }
 
     getScroller(el) {
+        // 按容器缓存滚动父节点：流式逐字更新时避免每个 token 都遍历祖先链调用 getComputedStyle
+        const cached = this.scrollerCache.get(el);
+        if (cached && cached.isConnected !== false) return cached;
+
         let current = el.parentElement;
+        let found = null;
         while (current && current !== document.body) {
             const style = window.getComputedStyle(current);
             if (style.overflowY === 'auto' || style.overflowY === 'scroll' || style.overflowY === 'overlay') {
-                return current;
+                found = current;
+                break;
             }
             current = current.parentElement;
         }
-        return document.querySelector('[data-list-id="chat-messages"]') || el.closest('[class*="scroller-"]');
+        if (!found) {
+            found = document.querySelector('[data-list-id="chat-messages"]') || el.closest('[class*="scroller-"]');
+        }
+        if (found) this.scrollerCache.set(el, found);
+        return found;
     }
 
     maintainScroll(scroller, container, action) {
@@ -272,96 +332,123 @@ module.exports = class Discord自动翻译 {
             ? "https://ark.cn-beijing.volces.com/api/v3/chat/completions"
             : "https://api.siliconflow.cn/v1/chat/completions";
 
-        try {
-            const response = await fetch(apiUrl, {
-                method: "POST",
-                headers: {
-                    "Authorization": `Bearer ${this.settings.apiKey}`,
-                    "Content-Type": "application/json"
-                },
-                body: JSON.stringify({
-                    model: this.settings.model,
-                    messages: [
-                        { role: "system", content: "你是一个翻译助手，只需将内容翻译成中文，直接输出结果，不要输出任何额外的解释。" },
-                        { role: "user", content: originalText }
-                    ],
-                    stream: true
-                })
-            });
+        let lastErr = null;
 
-            if (!response.ok) {
-                const errText = await response.text();
-                throw new Error(`HTTP ${response.status}: ${errText.slice(0, 50)}`);
-            }
+        for (let attempt = 1; attempt <= this.maxAttempts; attempt++) {
+            if (this.destroyed) return;
+            try {
+                const response = await fetch(apiUrl, {
+                    method: "POST",
+                    headers: {
+                        "Authorization": `Bearer ${this.settings.apiKey}`,
+                        "Content-Type": "application/json"
+                    },
+                    body: JSON.stringify({
+                        model: this.settings.model,
+                        messages: [
+                            { role: "system", content: "你是一个翻译助手，只需将内容翻译成中文，直接输出结果，不要输出任何额外的解释。" },
+                            { role: "user", content: originalText }
+                        ],
+                        stream: true
+                    })
+                });
 
-            const reader = response.body.getReader();
-            const decoder = new TextDecoder("utf-8");
-            let isFirstChunk = true;
-            let buffer = "";
-
-            // 按行消费缓冲：跨 TCP 块的半行数据留在 buffer 里等下一块，避免 JSON.parse 失败导致丢字
-            const consumeLine = (rawLine) => {
-                let line = rawLine.replace(/\r$/, "").trim();
-                if (!line) return;
-                if (line.startsWith(":")) return;
-                if (!line.startsWith("data:")) return;
-
-                const payload = line.slice(5).trim();
-                if (!payload || payload === "[DONE]") return;
-
-                let data;
-                try {
-                    data = JSON.parse(payload);
-                } catch (err) {
-                    return;
+                if (!response.ok) {
+                    const errText = await response.text();
+                    const err = new Error(`HTTP ${response.status}: ${errText.slice(0, 50)}`);
+                    // 4xx（鉴权/参数/额度类）重试无意义，只有 429 与 5xx 值得退避重试
+                    err.retryable = response.status === 429 || response.status >= 500;
+                    throw err;
                 }
-                const delta = data.choices && data.choices[0] && data.choices[0].delta;
-                if (!delta || !delta.content) return;
 
-                if (isFirstChunk) {
-                    cachedData.text = "";
-                    isFirstChunk = false;
+                const reader = response.body.getReader();
+                const decoder = new TextDecoder("utf-8");
+                let isFirstChunk = true;
+                let buffer = "";
+
+                // 按行消费缓冲：跨 TCP 块的半行数据留在 buffer 里等下一块，避免 JSON.parse 失败导致丢字
+                const consumeLine = (rawLine) => {
+                    let line = rawLine.replace(/\r$/, "").trim();
+                    if (!line) return;
+                    if (line.startsWith(":")) return;
+                    if (!line.startsWith("data:")) return;
+
+                    const payload = line.slice(5).trim();
+                    if (!payload || payload === "[DONE]") return;
+
+                    let data;
+                    try {
+                        data = JSON.parse(payload);
+                    } catch (err) {
+                        return;
+                    }
+                    const delta = data.choices && data.choices[0] && data.choices[0].delta;
+                    if (!delta || !delta.content) return;
+
+                    if (isFirstChunk) {
+                        cachedData.text = "";
+                        isFirstChunk = false;
+                    }
+                    cachedData.text += delta.content;
+
+                    const activeContainer = document.getElementById(messageId);
+                    if (activeContainer && activeContainer.dataset.aiScannedText === originalText) {
+                        this.renderTranslation(activeContainer, cachedData.text);
+                    }
+                };
+
+                while (true) {
+                    const { done, value } = await reader.read();
+                    if (done) break;
+
+                    buffer += decoder.decode(value, { stream: true });
+
+                    let idx;
+                    while ((idx = buffer.indexOf("\n")) !== -1) {
+                        consumeLine(buffer.slice(0, idx));
+                        buffer = buffer.slice(idx + 1);
+                    }
                 }
-                cachedData.text += delta.content;
+
+                buffer += decoder.decode();
+                if (buffer.trim()) consumeLine(buffer);
+
+                cachedData.status = 'done';
+                return;
+            } catch (e) {
+                lastErr = e;
+                const canRetry = e.retryable !== false && attempt < this.maxAttempts;
+                if (!canRetry) break;
+
+                const delay = this.retryBaseDelay * Math.pow(2, attempt - 1);
+                cachedData.status = 'translating';
+                cachedData.text = "";
 
                 const activeContainer = document.getElementById(messageId);
                 if (activeContainer && activeContainer.dataset.aiScannedText === originalText) {
-                    this.renderTranslation(activeContainer, cachedData.text);
+                    this.renderTranslation(activeContainer, `请求失败，${Math.round(delay / 1000)} 秒后重试（第 ${attempt} 次）...`);
                 }
-            };
 
-            while (true) {
-                const { done, value } = await reader.read();
-                if (done) break;
-
-                buffer += decoder.decode(value, { stream: true });
-
-                let idx;
-                while ((idx = buffer.indexOf("\n")) !== -1) {
-                    consumeLine(buffer.slice(0, idx));
-                    buffer = buffer.slice(idx + 1);
-                }
+                await new Promise(resolve => setTimeout(resolve, delay));
             }
+        }
 
-            buffer += decoder.decode();
-            if (buffer.trim()) consumeLine(buffer);
+        if (this.destroyed) return;
 
-            cachedData.status = 'done';
-        } catch (e) {
-            cachedData.status = 'error';
-            cachedData.text = `翻译出错: ${e.message}`;
+        cachedData.status = 'error';
+        cachedData.text = `翻译出错: ${lastErr ? lastErr.message : "未知错误"}（点击重试）`;
 
-            const activeContainer = document.getElementById(messageId);
-            if (activeContainer && activeContainer.dataset.aiScannedText === originalText) {
-                this.renderTranslation(activeContainer, cachedData.text, true);
-            }
+        const activeContainer = document.getElementById(messageId);
+        if (activeContainer && activeContainer.dataset.aiScannedText === originalText) {
+            this.renderTranslation(activeContainer, cachedData.text, true);
         }
     }
 
     getSettingsPanel() {
+        const c = this.getThemeColors();
         const panel = document.createElement("div");
         panel.style.padding = "10px";
-        panel.style.color = "#111";
+        panel.style.color = c.panelText;
 
         panel.innerHTML = `
             <div style="margin-bottom:15px;display:flex;justify-content:space-between;align-items:center;">
@@ -390,21 +477,21 @@ module.exports = class Discord自动翻译 {
             <div>
                 <label style="display:block;margin-bottom:5px;">模型名称 / 接入点名称</label>
                 <input type="text" id="m" placeholder="DeepSeek-V3 或 火山接入点ID">
-                <p style="font-size:11px;color:#666;margin-top:5px;">注：火山方舟请填写控制台的“接入点 ID”(ep-xxxxxx)。</p>
+                <p style="font-size:11px;color:${c.hint};margin-top:5px;">注：火山方舟请填写控制台的“接入点 ID”(ep-xxxxxx)。</p>
             </div>
         `;
 
         const setInputStyle = (el) => {
             if (!el) return;
-            el.style.background = "#fff";
-            el.style.color = "#111";
-            el.style.border = "1px solid #bbb";
+            el.style.background = c.inputBg;
+            el.style.color = c.inputColor;
+            el.style.border = `1px solid ${c.border}`;
             el.style.borderRadius = "6px";
             el.style.padding = "10px";
             el.style.outline = "none";
             if (el.style.setProperty) {
-                el.style.setProperty("background", "#fff", "important");
-                el.style.setProperty("color", "#111", "important");
+                el.style.setProperty("background", c.inputBg, "important");
+                el.style.setProperty("color", c.inputColor, "important");
             }
         };
 
@@ -422,8 +509,8 @@ module.exports = class Discord自动翻译 {
 
         if (select) {
             Array.from(select.options || []).forEach(opt => {
-                opt.style.background = "#fff";
-                opt.style.color = "#111";
+                opt.style.background = c.optionBg;
+                opt.style.color = c.inputColor;
             });
         }
 
